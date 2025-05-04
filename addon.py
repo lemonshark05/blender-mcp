@@ -14,7 +14,7 @@ from contextlib import redirect_stdout
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 2),
+    "version": (0, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -188,6 +188,9 @@ class BlenderMCPServer:
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
             "execute_code": self.execute_code,
+            "has_node_group":        self.has_node_group,
+            "get_node_group_inputs": self.get_node_group_inputs,
+            "set_node_group_input":  self.set_node_group_input,
         }
 
         handler = handlers.get(cmd_type)
@@ -203,9 +206,38 @@ class BlenderMCPServer:
                 return {"status": "error", "message": str(e)}
         else:
             return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
+    def has_node_group(self, group_name):
+        return group_name in bpy.data.node_groups
 
-    
-    
+    def get_node_group_inputs(self, group_name):
+        ng = bpy.data.node_groups.get(group_name)
+        if not ng:
+            raise ValueError(f"Node group not found: {group_name}")
+        inputs = []
+        for inp in ng.inputs:
+            inputs.append({
+                "name": inp.name,
+                "type": inp.type,
+                "default": inp.default_value
+            })
+        return inputs
+
+    def set_node_group_input(self, group_name, input_name, value):
+        if group_name not in bpy.data.node_groups:
+            return {"status": "error", "message": f"Node group '{group_name}' not found"}
+        modified = 0
+        for obj in bpy.context.scene.objects:
+            for mod in obj.modifiers:
+                if mod.type == 'NODES' and mod.node_group and mod.node_group.name == group_name:
+                    mod[input_name] = value
+                    modified += 1
+        return {
+            "modified_modifiers": modified,
+            "group": group_name,
+            "input": input_name,
+            "new_value": value
+        }
+      
     def get_scene_info(self):
         """Get information about the current Blender scene"""
         try:
@@ -677,30 +709,46 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
         
         return {'FINISHED'}
 
-# Registration functions
 def register():
-    bpy.types.Scene.blendermcp_port = bpy.props.IntProperty(name="Port", default=9876, min=1024, max=65535)
-    bpy.types.Scene.blendermcp_server_running = bpy.props.BoolProperty(name="Server Running", default=False)
-    bpy.types.Scene.blendermcp_use_nodecity = bpy.props.BoolProperty(name="Use Node City", default=False)
-    
+    # 1) Define scene-level properties (does not access any Scene instance)
+    bpy.types.Scene.blendermcp_port = bpy.props.IntProperty(
+        name="Port",
+        default=9876,
+        min=1024,
+        max=65535
+    )
+    bpy.types.Scene.blendermcp_server_running = bpy.props.BoolProperty(
+        name="Server Running",
+        default=False
+    )
+    bpy.types.Scene.blendermcp_use_nodecity = bpy.props.BoolProperty(
+        name="Use Node City",
+        default=False
+    )
+
+    # 2) Register the sidebar panel and connect/disconnect operators
     bpy.utils.register_class(BLENDERMCP_PT_Panel)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
-    
+
     print("BlenderMCP addon registered")
 
+
 def unregister():
-    # Stop the server if it's running
+    # 1) If the server was started, stop it
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()
         del bpy.types.blendermcp_server
-    
+
+    # 2) Unregister UI classes
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
-    
+
+    # 3) Remove the properties from the Scene type
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
+    del bpy.types.Scene.blendermcp_use_nodecity
 
     print("BlenderMCP addon unregistered")
 

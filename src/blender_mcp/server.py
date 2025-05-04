@@ -1,19 +1,32 @@
-# blender_mcp_server.py
-from mcp.server.fastmcp import FastMCP, Context, Image
+import shutil
+from pathlib import Path
+import importlib
 import socket
 import json
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
 import os
-from pathlib import Path
-import base64
-from urllib.parse import urlparse
+
+# ─── Auto-clean Python bytecode cache ───
+_PROJECT_ROOT = Path(__file__).parent
+for cache_dir in _PROJECT_ROOT.rglob("__pycache__"):
+    shutil.rmtree(cache_dir, ignore_errors=True)
+for pyc_file in _PROJECT_ROOT.rglob("*.pyc"):
+    try:
+        pyc_file.unlink()
+    except OSError:
+        pass
+importlib.invalidate_caches()
+# ─────────────────────────────────────────
+
+from mcp.server.fastmcp import FastMCP, Context, Image
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BlenderMCPServer")
 
@@ -21,302 +34,196 @@ logger = logging.getLogger("BlenderMCPServer")
 class BlenderConnection:
     host: str
     port: int
-    sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
-    
+    sock: socket.socket = None
+
     def connect(self) -> bool:
-        """Connect to the Blender addon socket server"""
         if self.sock:
             return True
-            
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
         except Exception as e:
-            logger.error(f"Failed to connect to Blender: {str(e)}")
+            logger.error(f"Failed to connect to Blender: {e}")
             self.sock = None
             return False
-    
+
     def disconnect(self):
-        """Disconnect from the Blender addon"""
         if self.sock:
             try:
                 self.sock.close()
             except Exception as e:
-                logger.error(f"Error disconnecting from Blender: {str(e)}")
+                logger.error(f"Error disconnecting: {e}")
             finally:
                 self.sock = None
 
     def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(15.0)  # Match the addon's timeout
-        
+        sock.settimeout(15.0)
         try:
             while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        # If we get an empty chunk, the connection might be closed
-                        if not chunks:  # If we haven't received anything yet, this is an error
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        # If we get here, it parsed successfully
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
-                        continue
-                except socket.timeout:
-                    # If we hit a timeout during receiving, break the loop and try to use what we have
-                    logger.warning("Socket timeout during chunked receive")
+                chunk = sock.recv(buffer_size)
+                if not chunk:
                     break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise  # Re-raise to be handled by the caller
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
+                chunks.append(chunk)
+                try:
+                    data = b''.join(chunks)
+                    json.loads(data.decode('utf-8'))
+                    return data
+                except json.JSONDecodeError:
+                    continue
         except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        # Try to use what we have
+            logger.warning(f"Receive warning: {e}")
         if chunks:
             data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
             try:
-                # Try to parse what we have
                 json.loads(data.decode('utf-8'))
                 return data
-            except json.JSONDecodeError:
-                # If we can't parse it, it's incomplete
+            except Exception:
                 raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
+        raise Exception("No data received")
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Blender and return the response"""
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Blender")
-        
-        command = {
-            "type": command_type,
-            "params": params or {}
-        }
-        
+        command = {"type": command_type, "params": params or {}}
         try:
-            # Log the command being sent
             logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
             self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(15.0)  # Match the addon's timeout
-            
-            # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
-            response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
-            if response.get("status") == "error":
-                logger.error(f"Blender error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Blender"))
-            
-            return response.get("result", {})
-        except socket.timeout:
-            logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
-            self.sock = None
-            raise Exception("Timeout waiting for Blender response - try simplifying your request")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Blender lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            raise Exception(f"Invalid response from Blender: {str(e)}")
+            data = self.receive_full_response(self.sock)
+            resp = json.loads(data.decode('utf-8'))
+            if resp.get('status') == 'error':
+                raise Exception(resp.get('message', 'Unknown error from Blender'))
+            return resp.get('result', {})
         except Exception as e:
-            logger.error(f"Error communicating with Blender: {str(e)}")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
             self.sock = None
-            raise Exception(f"Communication error with Blender: {str(e)}")
+            raise
+
+# Global persistent connection
+_blender_connection: BlenderConnection = None
+
+def get_blender_connection() -> BlenderConnection:
+    global _blender_connection
+    if _blender_connection:
+        try:
+            _blender_connection.send_command('get_scene_info')
+            return _blender_connection
+        except Exception:
+            _blender_connection.disconnect()
+            _blender_connection = None
+    _blender_connection = BlenderConnection(host='localhost', port=9876)
+    if not _blender_connection.connect():
+        raise Exception("Could not connect to Blender. Ensure the addon is running.")
+    return _blender_connection
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
-    """Manage server startup and shutdown lifecycle"""
-    # We don't need to create a connection here since we're using the global connection
-    # for resources and tools
-    
     try:
-        # Just log that we're starting up
         logger.info("BlenderMCP server starting up")
-        
-        # Try to connect to Blender on startup to verify it's available
-        try:
-            # This will initialize the global connection if needed
-            blender = get_blender_connection()
-            logger.info("Successfully connected to Blender on startup")
-        except Exception as e:
-            logger.warning(f"Could not connect to Blender on startup: {str(e)}")
-            logger.warning("Make sure the Blender addon is running before using Blender resources or tools")
-        
-        # Return an empty context - we're using the global connection
+        startup_check_nodecity()
         yield {}
     finally:
-        # Clean up the global connection on shutdown
         global _blender_connection
         if _blender_connection:
-            logger.info("Disconnecting from Blender on shutdown")
             _blender_connection.disconnect()
             _blender_connection = None
         logger.info("BlenderMCP server shut down")
 
-# Create the MCP server with lifespan support
+# Initialize MCP server
+data_files = [ 
+    (".bl_info.json", None)
+]
 mcp = FastMCP(
     "BlenderMCP",
     description="Blender integration through the Model Context Protocol",
     lifespan=server_lifespan
 )
 
-# Resource endpoints
+# Startup check for NodeCity node group
+def startup_check_nodecity():
+    try:
+        blender = get_blender_connection()
+        exists = blender.send_command('has_node_group', {'group_name': 'NodeCity'})
+        found = exists.get('result', False) if isinstance(exists, dict) else bool(exists)
+        if found:
+            logger.info("✅ Found 'NodeCity' node group")
+        else:
+            logger.warning("⚠️ 'NodeCity' node group not found in project")
+    except Exception as e:
+        logger.error(f"Error checking NodeCity: {e}")
 
-# Global connection for resources (since resources can't access context)
-_blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
-
-def get_blender_connection():
-    """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
-    # If we have an existing connection, check if it's still valid
-    if _blender_connection is not None:
-        try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
-            return _blender_connection
-        except Exception as e:
-            # Connection is dead, close it and create a new one
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _blender_connection.disconnect()
-            except:
-                pass
-            _blender_connection = None
-    
-    # Create a new connection if needed
-    if _blender_connection is None:
-        _blender_connection = BlenderConnection(host="localhost", port=9876)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-        logger.info("Created new persistent connection to Blender")
-    
-    return _blender_connection
-
+# === MCP Tools ===
 
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
-    """Get detailed information about the current Blender scene"""
+    """Get detailed information about the current Blender scene."""
     try:
         blender = get_blender_connection()
-        result = blender.send_command("get_scene_info")
-        
-        # Just return the JSON representation of what Blender sent us
+        result = blender.send_command('get_scene_info')
         return json.dumps(result, indent=2)
     except Exception as e:
-        logger.error(f"Error getting scene info from Blender: {str(e)}")
-        return f"Error getting scene info: {str(e)}"
+        logger.error(f"Error getting scene info: {e}")
+        return f"Error getting scene info: {e}"
 
 @mcp.tool()
 def get_object_info(ctx: Context, object_name: str) -> str:
-    """
-    Get detailed information about a specific object in the Blender scene.
-    
-    Parameters:
-    - object_name: The name of the object to get information about
-    """
+    """Get detailed information about a specific object."""
     try:
         blender = get_blender_connection()
-        result = blender.send_command("get_object_info", {"name": object_name})
-        
-        # Just return the JSON representation of what Blender sent us
+        result = blender.send_command('get_object_info', {'name': object_name})
         return json.dumps(result, indent=2)
     except Exception as e:
-        logger.error(f"Error getting object info from Blender: {str(e)}")
-        return f"Error getting object info: {str(e)}"
-
-
+        logger.error(f"Error getting object info: {e}")
+        return f"Error getting object info: {e}"
 
 @mcp.tool()
 def execute_blender_code(ctx: Context, code: str) -> str:
-    """
-    Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
-    
-    Parameters:
-    - code: The Python code to execute
-    """
+    """Execute arbitrary Python code in Blender."""
     try:
-        # Get the global connection
         blender = get_blender_connection()
-        
-        result = blender.send_command("execute_code", {"code": code})
+        result = blender.send_command('execute_code', {'code': code})
         return f"Code executed successfully: {result.get('result', '')}"
     except Exception as e:
-        logger.error(f"Error executing code: {str(e)}")
-        return f"Error executing code: {str(e)}"
+        logger.error(f"Error executing code: {e}")
+        return f"Error executing code: {e}"
 
 @mcp.tool()
-def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
-    """
-    Get a list of categories for a specific asset type on Polyhaven.
-    
-    Parameters:
-    - asset_type: The type of asset to get categories for (hdris, textures, models, all)
-    """
+def has_node_group(ctx: Context, group_name: str) -> str:
+    """Check if a Geometry Node Group exists."""
     try:
         blender = get_blender_connection()
-        if not _polyhaven_enabled:
-            return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
-        result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        # Format the categories in a more readable way
-        categories = result["categories"]
-        formatted_output = f"Categories for {asset_type}:\n\n"
-        
-        # Sort categories by count (descending)
-        sorted_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)
-        
-        for category, count in sorted_categories:
-            formatted_output += f"- {category}: {count} assets\n"
-        
-        return formatted_output
-    except Exception as e:
-        logger.error(f"Error getting Polyhaven categories: {str(e)}")
-        return f"Error getting Polyhaven categories: {str(e)}"
+    except Exception:
+        return "Error: Could not connect to Blender."
+    result = blender.send_command('has_node_group', {'group_name': group_name})
+    exists = result.get('result', False) if isinstance(result, dict) else bool(result)
+    return f"Node group '{group_name}' exists: {exists}"
+
+@mcp.tool()
+def get_node_group_inputs(ctx: Context, group_name: str) -> str:
+    """List interface inputs of a node group."""
+    blender = get_blender_connection()
+    result = blender.send_command('get_node_group_inputs', {'group_name': group_name})
+    inputs = result.get('result', [])
+    if not inputs:
+        return f"No inputs found for '{group_name}'."
+    lines = [f"- {i['name']} ({i['type']}), default={i['default']}" for i in inputs]
+    return f"Inputs for '{group_name}':\n" + "\n".join(lines)
+
+@mcp.tool()
+def set_node_group_input(
+    ctx: Context,
+    group_name: str,
+    input_name: str,
+    value: Any
+) -> str:
+    """Set a node group input interface value."""
+    blender = get_blender_connection()
+    params = {'group_name': group_name, 'input_name': input_name, 'value': value}
+    result = blender.send_command('set_node_group_input', params)
+    if 'modified_modifiers' in result:
+        return f"Set '{input_name}'={value} on {result['modified_modifiers']} modifier(s)."
+    return f"Error: {result.get('message', 'unknown')}"
 
 @mcp.tool()
 def set_texture(
@@ -324,75 +231,94 @@ def set_texture(
     object_name: str,
     texture_id: str
 ) -> str:
-    """
-    Apply a previously downloaded Polyhaven texture to an object.
-    
-    Parameters:
-    - object_name: Name of the object to apply the texture to
-    - texture_id: ID of the Polyhaven texture to apply (must be downloaded first)
-    
-    Returns a message indicating success or failure.
-    """
+    """Apply a Polyhaven texture to an object."""
     try:
-        # Get the global connection
         blender = get_blender_connection()
-        
-        result = blender.send_command("set_texture", {
-            "object_name": object_name,
-            "texture_id": texture_id
-        })
-        
-        if "error" in result:
+        result = blender.send_command('set_texture', {'object_name': object_name, 'texture_id': texture_id})
+        if 'error' in result:
             return f"Error: {result['error']}"
-        
-        if result.get("success"):
-            material_name = result.get("material", "")
-            maps = ", ".join(result.get("maps", []))
-            
-            # Add detailed material info
-            material_info = result.get("material_info", {})
-            node_count = material_info.get("node_count", 0)
-            has_nodes = material_info.get("has_nodes", False)
-            texture_nodes = material_info.get("texture_nodes", [])
-            
-            output = f"Successfully applied texture '{texture_id}' to {object_name}.\n"
-            output += f"Using material '{material_name}' with maps: {maps}.\n\n"
-            output += f"Material has nodes: {has_nodes}\n"
-            output += f"Total node count: {node_count}\n\n"
-            
-            if texture_nodes:
-                output += "Texture nodes:\n"
-                for node in texture_nodes:
-                    output += f"- {node['name']} using image: {node['image']}\n"
-                    if node['connections']:
-                        output += "  Connections:\n"
-                        for conn in node['connections']:
-                            output += f"    {conn}\n"
-            else:
-                output += "No texture nodes found in the material.\n"
-            
-            return output
-        else:
-            return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
+        material_info = result.get('material_info', {})
+        info = [f"Material='{result.get('material')}'; maps={result.get('maps')}" ]
+        info.append(f"Nodes={material_info.get('node_count')}, has_nodes={material_info.get('has_nodes')}" )
+        return "Successfully applied texture. " + "; ".join(info)
     except Exception as e:
-        logger.error(f"Error applying texture: {str(e)}")
-        return f"Error applying texture: {str(e)}"
+        logger.error(f"Error applying texture: {e}")
+        return f"Error applying texture: {e}"
+
+# === NodeCity Automation Tools ===
+
+@mcp.tool()
+def scan_nodecity_inputs(ctx: Context) -> str:
+    """Scan and return all input sockets of the 'NodeCity' node group."""
+    blender = get_blender_connection()
+    result = blender.send_command('get_node_group_inputs', {'group_name': 'NodeCity'})
+    inputs = result.get('result', [])
+    if not inputs:
+        return "⚠️ 'NodeCity' found but has no inputs."
+    return "\n".join([f"- {inp['name']} ({inp['type']}), default={inp['default']}" for inp in inputs])
+
+@mcp.tool()
+def create_nodecity(ctx: Context, params: Dict[str, Any]) -> str:
+    """Create an empty object, add NodeCity modifier, and apply params."""
+    blender = get_blender_connection()
+    params_json = json.dumps(params)
+    code = f'''import bpy, json
+# Create new empty
+obj = bpy.data.objects.new("NodeCityInstance", None)
+bpy.context.collection.objects.link(obj)
+# Add geometry nodes modifier
+mod = obj.modifiers.new(name="NodeCity", type="NODES")
+mod.node_group = bpy.data.node_groups.get("NodeCity")
+# Apply params
+dict_params = json.loads(r"""{params_json}"""')
+for name, value in dict_params.items():
+    try: setattr(mod, name, value)
+    except: pass
+# Select and activate
+bpy.context.view_layer.objects.active = obj
+obj.select_set(True)
+print("Created NodeCityInstance", dict_params)'''  # noqa
+    blender.send_command('execute_code', {'code': code})
+    return f"✅ Created NodeCityInstance with params: {params}"
 
 @mcp.prompt()
-def asset_creation_strategy() -> str:
-    return """\
-When creating 3D content in Blender, always start by checking the scene (get_scene_info()).
+def nodecity_autocreate(ctx: Context, user_input: str) -> str:
+    """Auto workflow: scan inputs, ask LLM for values, create instance."""
+    # Ensure Blender is connected
+    try:
+        get_blender_connection()
+    except Exception:
+        return None  # skip autocreate if not connected
 
-1. Use get_object_info(name) to inspect specific items.
-2. If you need to automate repetitive tasks, use execute_blender_code(code).
-3. Only fall back to scripting primitives when necessary.
+    if not re.search(r"\bNodeCity\b", user_input, re.IGNORECASE):
+        return None
+
+    # Step 1: scan
+    scan = scan_nodecity_inputs(ctx)
+    # Step 2: LLM picks values
+    llm_prompt = f"""
+The NodeCity input sockets are:
+{scan}
+Choose values for a modern high-density city and respond with only a JSON dict mapping input names to values.
 """
+    llm_resp = ctx.llm({"role":"user","content":llm_prompt})
+    try:
+        params = json.loads(llm_resp.content)
+    except Exception:
+        return "❌ Failed parsing JSON: " + llm_resp.content
 
-# Main execution
+    # Step 3: create
+    try:
+        return create_nodecity(ctx, params)
+    except Exception as e:
+        return f"❌ Creation error: {e}"
 
+# Start server
 def main():
-    """Run the MCP server"""
+    tools = asyncio.run(mcp.list_tools())
+    names = list(tools.keys()) if isinstance(tools, dict) else list(tools)
+    logger.info(f"Registered MCP tools: {names}")
     mcp.run()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
