@@ -1,7 +1,6 @@
-# Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
-
 import bpy
-import mathutils
+import os
+import bmesh
 import json
 import threading
 import socket
@@ -10,6 +9,8 @@ import traceback
 from bpy.props import StringProperty, IntProperty, BoolProperty, EnumProperty
 import io
 from contextlib import redirect_stdout
+import re
+from typing import Any
 
 bl_info = {
     "name": "Blender MCP",
@@ -191,6 +192,9 @@ class BlenderMCPServer:
             "has_node_group":        self.has_node_group,
             "get_node_group_inputs": self.get_node_group_inputs,
             "set_node_group_input":  self.set_node_group_input,
+            "list_parts":        self.list_parts,
+            "replace_part":      self.replace_part,
+            "init_model": self.init_model,
         }
 
         handler = handlers.get(cmd_type)
@@ -206,6 +210,109 @@ class BlenderMCPServer:
                 return {"status": "error", "message": str(e)}
         else:
             return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
+        
+    def list_parts(self):
+        """Return a dict of all available part-objects grouped by type."""
+        if not bpy.context.scene.blendermcp_use_roles:
+            return {"status":"error", "message":"Role Models disabled in UI"}
+        
+        out = {"Head": [], "Waist": [], "Leg": [], "Arm": []}
+        pat = re.compile(r"^(Head|Waist|Leg|Arm)(?:[\._].*)?$")
+        for obj in bpy.data.objects:
+            m = pat.match(obj.name)
+            if m:
+                out[m.group(1)].append(obj.name)
+        return out
+    
+    def init_model(self):
+        """Load the base mesh plus all Marker_ objects into the scene."""
+        if not bpy.context.scene.blendermcp_use_roles:
+            return {"status":"error", "message":"Role Models disabled in UI"}
+        
+        asset_dir  = "/Users/hula/Documents/Female"
+        blend_file = "CustomizeFemaleBaseMesh_AnimeStyle_v1_3_AssetBrowser.blend"
+        blend_path = os.path.join(asset_dir, blend_file)
+
+        # 1. Load base + markers
+        with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+            dst.objects = [name for name in src.objects
+                            if name == "AnimeStyle_Female_Base" or name.startswith("Marker_")]
+            dst.meshes  = list(src.meshes)
+
+        # 2. Link into scene & zero the base
+        for obj in dst.objects:
+            if obj is None: continue
+            if obj.name not in bpy.context.scene.collection.objects:
+                bpy.context.scene.collection.objects.link(obj)
+            if obj.name.startswith("AnimeStyle_Female_Base"):
+                obj.location = (0,0,0)
+
+        return {"status":"success", "message":"Base character initialized"}
+
+    def replace_part(self, part_type: str, new_name: str):
+        """
+        Delete the old faces/material slots for a given part_type,
+        append+align+join the new asset named new_name under Marker_<part_type>.
+        """
+        if not bpy.context.scene.blendermcp_use_roles:
+            return {"status":"error", "message":"Role Models disabled in UI"}
+        
+        # 1) find base mesh
+        base = max(
+            (o for o in bpy.data.objects if o.type=='MESH' and o.name.startswith("AnimeStyle_Female_Base")),
+            key=lambda o: len(o.data.vertices),
+            default=None
+        )
+        if not base:
+            raise RuntimeError("Base mesh not found")
+
+        # 2) delete old faces + slots
+        import bmesh
+        bm = bmesh.new(); bm.from_mesh(base.data)
+        # collect slot indices whose root == part_type
+        to_remove = [
+            i for i,slot in enumerate(base.material_slots)
+            if slot.material and slot.material.name.split('.',1)[0] == part_type
+        ]
+        for face in [f for f in bm.faces if f.material_index in to_remove]:
+            bm.faces.remove(face)
+        # remove orphan verts
+        for v in [v for v in bm.verts if not v.link_faces]:
+            bm.verts.remove(v)
+        bm.to_mesh(base.data); base.data.update()
+        for idx in sorted(to_remove, reverse=True):
+            base.data.materials.pop(index=idx)
+        bm.free()
+
+        # 3) append new object
+        blend_path = os.path.join("/Users/hula/Documents/Female",
+                                  "CustomizeFemaleBaseMesh_AnimeStyle_v1_3_AssetBrowser.blend")
+        with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+            if new_name not in src.objects:
+                raise RuntimeError(f"{new_name} not found")
+            dst.objects = [new_name]
+        new_obj = bpy.data.objects[new_name]
+        # link if needed
+        coll = bpy.context.scene.collection
+        if new_obj.name not in coll.objects:
+            coll.objects.link(new_obj)
+
+        # 4) align
+        marker = bpy.data.objects.get(f"Marker_{part_type}")
+        if not marker:
+            raise RuntimeError(f"Marker_{part_type} not found")
+        new_obj.matrix_world = marker.matrix_world.copy()
+
+        # 5) join
+        for o in bpy.context.view_layer.objects:
+            o.select_set(False)
+        base.select_set(True)
+        new_obj.select_set(True)
+        bpy.context.view_layer.objects.active = base
+        bpy.ops.object.join()
+
+        return {"status":"success", "message": f"{part_type} replaced with {new_name}"}
+    
     def has_node_group(self, group_name):
         return group_name in bpy.data.node_groups
 
@@ -213,31 +320,56 @@ class BlenderMCPServer:
         ng = bpy.data.node_groups.get(group_name)
         if not ng:
             raise ValueError(f"Node group not found: {group_name}")
-        inputs = []
-        for inp in ng.inputs:
-            inputs.append({
-                "name": inp.name,
-                "type": inp.type,
-                "default": inp.default_value
-            })
-        return inputs
+        out = []
+        for item in ng.interface.items_tree:
+            # only sockets, not frames/etc.
+            if getattr(item, "item_type", "") == "SOCKET" and item.in_out == "INPUT":
+                out.append({
+                    "name": item.name,
+                    "type": item.socket_type,
+                    "default": getattr(item, "default_value", None),
+                    "identifier": item.identifier,
+                })
+        return out
 
-    def set_node_group_input(self, group_name, input_name, value):
-        if group_name not in bpy.data.node_groups:
-            return {"status": "error", "message": f"Node group '{group_name}' not found"}
-        modified = 0
-        for obj in bpy.context.scene.objects:
-            for mod in obj.modifiers:
-                if mod.type == 'NODES' and mod.node_group and mod.node_group.name == group_name:
-                    mod[input_name] = value
-                    modified += 1
+    def set_node_group_input(self, group_name: str, input_name: str, value: Any):
+        import re, bpy
+        def normalize(s: str) -> str:
+            return re.sub(r"[\s_]+", "", s).lower()
+
+        ng = bpy.data.node_groups.get(group_name)
+        if not ng:
+            return {"status":"error","message":f"Node group '{group_name}' not found"}
+
+        # find the interface socket
+        key = normalize(input_name)
+        target = None
+        for item in ng.interface.items_tree:
+            if item.in_out=="INPUT" and normalize(item.name)==key:
+                target = item
+                break
+        if not target:
+            return {"status":"error","message":f"Input '{input_name}' not found"}
+
+        try:
+            target.default_value = value
+        except Exception as e:
+            return {"status":"error","message":f"Failed to set default: {e}"}
+
+        # refresh  
+        bpy.context.view_layer.update()
+        for w in bpy.context.window_manager.windows:
+            for area in w.screen.areas:
+                area.tag_redraw()
+
         return {
-            "modified_modifiers": modified,
-            "group": group_name,
-            "input": input_name,
-            "new_value": value
+            "status":"success",
+            "group":group_name,
+            "input":target.name,
+            "new_value":value
         }
-      
+
+
     def get_scene_info(self):
         """Get information about the current Blender scene"""
         try:
@@ -346,311 +478,6 @@ class BlenderMCPServer:
         except Exception as e:
             raise Exception(f"Code execution error: {str(e)}")
 
-    def set_texture(self, object_name, texture_id):
-        """Apply a previously downloaded Polyhaven texture to an object by creating a new material"""
-        try:
-            # Get the object
-            obj = bpy.data.objects.get(object_name)
-            if not obj:
-                return {"error": f"Object not found: {object_name}"}
-            
-            # Make sure object can accept materials
-            if not hasattr(obj, 'data') or not hasattr(obj.data, 'materials'):
-                return {"error": f"Object {object_name} cannot accept materials"}
-            
-            # Find all images related to this texture and ensure they're properly loaded
-            texture_images = {}
-            for img in bpy.data.images:
-                if img.name.startswith(texture_id + "_"):
-                    # Extract the map type from the image name
-                    map_type = img.name.split('_')[-1].split('.')[0]
-                    
-                    # Force a reload of the image
-                    img.reload()
-                    
-                    # Ensure proper color space
-                    if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                        try:
-                            img.colorspace_settings.name = 'sRGB'
-                        except:
-                            pass
-                    else:
-                        try:
-                            img.colorspace_settings.name = 'Non-Color'
-                        except:
-                            pass
-                    
-                    # Ensure the image is packed
-                    if not img.packed_file:
-                        img.pack()
-                    
-                    texture_images[map_type] = img
-                    print(f"Loaded texture map: {map_type} - {img.name}")
-                    
-                    # Debug info
-                    print(f"Image size: {img.size[0]}x{img.size[1]}")
-                    print(f"Color space: {img.colorspace_settings.name}")
-                    print(f"File format: {img.file_format}")
-                    print(f"Is packed: {bool(img.packed_file)}")
-
-            if not texture_images:
-                return {"error": f"No texture images found for: {texture_id}. Please download the texture first."}
-            
-            # Create a new material
-            new_mat_name = f"{texture_id}_material_{object_name}"
-            
-            # Remove any existing material with this name to avoid conflicts
-            existing_mat = bpy.data.materials.get(new_mat_name)
-            if existing_mat:
-                bpy.data.materials.remove(existing_mat)
-            
-            new_mat = bpy.data.materials.new(name=new_mat_name)
-            new_mat.use_nodes = True
-            
-            # Set up the material nodes
-            nodes = new_mat.node_tree.nodes
-            links = new_mat.node_tree.links
-            
-            # Clear default nodes
-            nodes.clear()
-            
-            # Create output node
-            output = nodes.new(type='ShaderNodeOutputMaterial')
-            output.location = (600, 0)
-            
-            # Create principled BSDF node
-            principled = nodes.new(type='ShaderNodeBsdfPrincipled')
-            principled.location = (300, 0)
-            links.new(principled.outputs[0], output.inputs[0])
-            
-            # Add texture nodes based on available maps
-            tex_coord = nodes.new(type='ShaderNodeTexCoord')
-            tex_coord.location = (-800, 0)
-            
-            mapping = nodes.new(type='ShaderNodeMapping')
-            mapping.location = (-600, 0)
-            mapping.vector_type = 'TEXTURE'  # Changed from default 'POINT' to 'TEXTURE'
-            links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
-            
-            # Position offset for texture nodes
-            x_pos = -400
-            y_pos = 300
-            
-            # Connect different texture maps
-            for map_type, image in texture_images.items():
-                tex_node = nodes.new(type='ShaderNodeTexImage')
-                tex_node.location = (x_pos, y_pos)
-                tex_node.image = image
-                
-                # Set color space based on map type
-                if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                    try:
-                        tex_node.image.colorspace_settings.name = 'sRGB'
-                    except:
-                        pass  # Use default if sRGB not available
-                else:
-                    try:
-                        tex_node.image.colorspace_settings.name = 'Non-Color'
-                    except:
-                        pass  # Use default if Non-Color not available
-                
-                links.new(mapping.outputs['Vector'], tex_node.inputs['Vector'])
-                
-                # Connect to appropriate input on Principled BSDF
-                if map_type.lower() in ['color', 'diffuse', 'albedo']:
-                    links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
-                elif map_type.lower() in ['roughness', 'rough']:
-                    links.new(tex_node.outputs['Color'], principled.inputs['Roughness'])
-                elif map_type.lower() in ['metallic', 'metalness', 'metal']:
-                    links.new(tex_node.outputs['Color'], principled.inputs['Metallic'])
-                elif map_type.lower() in ['normal', 'nor', 'dx', 'gl']:
-                    # Add normal map node
-                    normal_map = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map.location = (x_pos + 200, y_pos)
-                    links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
-                    links.new(normal_map.outputs['Normal'], principled.inputs['Normal'])
-                elif map_type.lower() in ['displacement', 'disp', 'height']:
-                    # Add displacement node
-                    disp_node = nodes.new(type='ShaderNodeDisplacement')
-                    disp_node.location = (x_pos + 200, y_pos - 200)
-                    disp_node.inputs['Scale'].default_value = 0.1  # Reduce displacement strength
-                    links.new(tex_node.outputs['Color'], disp_node.inputs['Height'])
-                    links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
-                
-                y_pos -= 250
-            
-            # Second pass: Connect nodes with proper handling for special cases
-            texture_nodes = {}
-            
-            # First find all texture nodes and store them by map type
-            for node in nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    for map_type, image in texture_images.items():
-                        if node.image == image:
-                            texture_nodes[map_type] = node
-                            break
-            
-            # Now connect everything using the nodes instead of images
-            # Handle base color (diffuse)
-            for map_name in ['color', 'diffuse', 'albedo']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Base Color'])
-                    print(f"Connected {map_name} to Base Color")
-                    break
-            
-            # Handle roughness
-            for map_name in ['roughness', 'rough']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Roughness'])
-                    print(f"Connected {map_name} to Roughness")
-                    break
-            
-            # Handle metallic
-            for map_name in ['metallic', 'metalness', 'metal']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Metallic'])
-                    print(f"Connected {map_name} to Metallic")
-                    break
-            
-            # Handle normal maps
-            for map_name in ['gl', 'dx', 'nor']:
-                if map_name in texture_nodes:
-                    normal_map_node = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map_node.location = (100, 100)
-                    links.new(texture_nodes[map_name].outputs['Color'], normal_map_node.inputs['Color'])
-                    links.new(normal_map_node.outputs['Normal'], principled.inputs['Normal'])
-                    print(f"Connected {map_name} to Normal")
-                    break
-            
-            # Handle displacement
-            for map_name in ['displacement', 'disp', 'height']:
-                if map_name in texture_nodes:
-                    disp_node = nodes.new(type='ShaderNodeDisplacement')
-                    disp_node.location = (300, -200)
-                    disp_node.inputs['Scale'].default_value = 0.1  # Reduce displacement strength
-                    links.new(texture_nodes[map_name].outputs['Color'], disp_node.inputs['Height'])
-                    links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
-                    print(f"Connected {map_name} to Displacement")
-                    break
-            
-            # Handle ARM texture (Ambient Occlusion, Roughness, Metallic)
-            if 'arm' in texture_nodes:
-                separate_rgb = nodes.new(type='ShaderNodeSeparateRGB')
-                separate_rgb.location = (-200, -100)
-                links.new(texture_nodes['arm'].outputs['Color'], separate_rgb.inputs['Image'])
-                
-                # Connect Roughness (G) if no dedicated roughness map
-                if not any(map_name in texture_nodes for map_name in ['roughness', 'rough']):
-                    links.new(separate_rgb.outputs['G'], principled.inputs['Roughness'])
-                    print("Connected ARM.G to Roughness")
-                
-                # Connect Metallic (B) if no dedicated metallic map
-                if not any(map_name in texture_nodes for map_name in ['metallic', 'metalness', 'metal']):
-                    links.new(separate_rgb.outputs['B'], principled.inputs['Metallic'])
-                    print("Connected ARM.B to Metallic")
-                
-                # For AO (R channel), multiply with base color if we have one
-                base_color_node = None
-                for map_name in ['color', 'diffuse', 'albedo']:
-                    if map_name in texture_nodes:
-                        base_color_node = texture_nodes[map_name]
-                        break
-                
-                if base_color_node:
-                    mix_node = nodes.new(type='ShaderNodeMixRGB')
-                    mix_node.location = (100, 200)
-                    mix_node.blend_type = 'MULTIPLY'
-                    mix_node.inputs['Fac'].default_value = 0.8  # 80% influence
-                    
-                    # Disconnect direct connection to base color
-                    for link in base_color_node.outputs['Color'].links:
-                        if link.to_socket == principled.inputs['Base Color']:
-                            links.remove(link)
-                    
-                    # Connect through the mix node
-                    links.new(base_color_node.outputs['Color'], mix_node.inputs[1])
-                    links.new(separate_rgb.outputs['R'], mix_node.inputs[2])
-                    links.new(mix_node.outputs['Color'], principled.inputs['Base Color'])
-                    print("Connected ARM.R to AO mix with Base Color")
-            
-            # Handle AO (Ambient Occlusion) if separate
-            if 'ao' in texture_nodes:
-                base_color_node = None
-                for map_name in ['color', 'diffuse', 'albedo']:
-                    if map_name in texture_nodes:
-                        base_color_node = texture_nodes[map_name]
-                        break
-                
-                if base_color_node:
-                    mix_node = nodes.new(type='ShaderNodeMixRGB')
-                    mix_node.location = (100, 200)
-                    mix_node.blend_type = 'MULTIPLY'
-                    mix_node.inputs['Fac'].default_value = 0.8  # 80% influence
-                    
-                    # Disconnect direct connection to base color
-                    for link in base_color_node.outputs['Color'].links:
-                        if link.to_socket == principled.inputs['Base Color']:
-                            links.remove(link)
-                    
-                    # Connect through the mix node
-                    links.new(base_color_node.outputs['Color'], mix_node.inputs[1])
-                    links.new(texture_nodes['ao'].outputs['Color'], mix_node.inputs[2])
-                    links.new(mix_node.outputs['Color'], principled.inputs['Base Color'])
-                    print("Connected AO to mix with Base Color")
-            
-            # CRITICAL: Make sure to clear all existing materials from the object
-            while len(obj.data.materials) > 0:
-                obj.data.materials.pop(index=0)
-            
-            # Assign the new material to the object
-            obj.data.materials.append(new_mat)
-            
-            # CRITICAL: Make the object active and select it
-            bpy.context.view_layer.objects.active = obj
-            obj.select_set(True)
-            
-            # CRITICAL: Force Blender to update the material
-            bpy.context.view_layer.update()
-            
-            # Get the list of texture maps
-            texture_maps = list(texture_images.keys())
-            
-            # Get info about texture nodes for debugging
-            material_info = {
-                "name": new_mat.name,
-                "has_nodes": new_mat.use_nodes,
-                "node_count": len(new_mat.node_tree.nodes),
-                "texture_nodes": []
-            }
-            
-            for node in new_mat.node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    connections = []
-                    for output in node.outputs:
-                        for link in output.links:
-                            connections.append(f"{output.name} → {link.to_node.name}.{link.to_socket.name}")
-                    
-                    material_info["texture_nodes"].append({
-                        "name": node.name,
-                        "image": node.image.name,
-                        "colorspace": node.image.colorspace_settings.name,
-                        "connections": connections
-                    })
-            
-            return {
-                "success": True,
-                "message": f"Created new material and applied texture {texture_id} to {object_name}",
-                "material": new_mat.name,
-                "maps": texture_maps,
-                "material_info": material_info
-            }
-            
-        except Exception as e:
-            print(f"Error in set_texture: {str(e)}")
-            traceback.print_exc()
-            return {"error": f"Failed to apply texture: {str(e)}"}
-
-
 # Blender UI Panel
 class BLENDERMCP_PT_Panel(bpy.types.Panel):
     bl_label = "Blender MCP"
@@ -664,7 +491,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         scene = context.scene
         
         layout.prop(scene, "blendermcp_port")
-        layout.prop(scene, "blendermcp_use_nodecity", text="Use assets from Node City")
+        layout.prop(scene, "blendermcp_use_roles", text="Use assets from Role Models")
 
         if not scene.blendermcp_server_running:
             layout.operator("blendermcp.start_server", text="Connect to MCP server")
@@ -709,6 +536,16 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
         
         return {'FINISHED'}
 
+def on_use_roles_update(self, context):
+    enabled = context.scene.blendermcp_use_roles
+    msg = "Role Models ENABLED" if enabled else "Role Models DISABLED"
+    # 1) Print to the system console
+    print(f"[BlenderMCP] {msg}")
+    # 2) Show a quick popup in the UI
+    def draw(self, context):
+        self.layout.label(text=msg)
+    context.window_manager.popup_menu(draw, title="BlenderMCP", icon='INFO')
+
 def register():
     # 1) Define scene-level properties (does not access any Scene instance)
     bpy.types.Scene.blendermcp_port = bpy.props.IntProperty(
@@ -721,10 +558,11 @@ def register():
         name="Server Running",
         default=False
     )
-    bpy.types.Scene.blendermcp_use_nodecity = bpy.props.BoolProperty(
-        name="Use Node City",
-        default=False
-    )
+    bpy.types.Scene.blendermcp_use_roles = bpy.props.BoolProperty(
+      name="Use assets from Role Models",
+       default=False,
+       update=on_use_roles_update
+   )
 
     # 2) Register the sidebar panel and connect/disconnect operators
     bpy.utils.register_class(BLENDERMCP_PT_Panel)
@@ -748,7 +586,7 @@ def unregister():
     # 3) Remove the properties from the Scene type
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
-    del bpy.types.Scene.blendermcp_use_nodecity
+    del bpy.types.Scene.blendermcp_use_roles
 
     print("BlenderMCP addon unregistered")
 

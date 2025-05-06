@@ -8,8 +8,7 @@ import logging
 import re
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List
-import os
+from typing import AsyncIterator, Dict, Any
 
 # ─── Auto-clean Python bytecode cache ───
 _PROJECT_ROOT = Path(__file__).parent
@@ -99,6 +98,65 @@ class BlenderConnection:
         except Exception as e:
             self.sock = None
             raise
+
+# A manifest of every tool your MCP server exposes:
+TOOL_MANIFEST = [
+    {
+        "name": "get_scene_info",
+        "description": "Get basic info about the current Blender scene (objects, materials).",
+        "params": {}
+    },
+    {
+        "name": "get_object_info",
+        "description": "Get detailed info about a named object.",
+        "params": {"object_name": "string"}
+    },
+    {
+        "name": "execute_blender_code",
+        "description": "Run arbitrary Python code in Blender.",
+        "params": {"code": "string"}
+    },
+    {
+        "name": "list_parts",
+        "description": "List all available Head/Waist/Leg/Arm asset names.",
+        "params": {}
+    },
+    {
+        "name": "init_model",
+        "description": "Load the base female character mesh plus Marker_ objects.",
+        "params": {}
+    },
+    {
+        "name": "replace_part",
+        "description": "Swap a body part. Params: part_type (Head/Arm/Leg/Waist), new_name (asset).",
+        "params": {"part_type": "string", "new_name": "string"}
+    },
+    {
+        "name": "has_node_group",
+        "description": "Check if a Geometry Node Group exists.",
+        "params": {"group_name": "string"}
+    },
+    {
+        "name": "get_node_group_inputs",
+        "description": "Get input sockets of a node group.",
+        "params": {"group_name": "string"}
+    },
+    {
+        "name": "set_node_group_input",
+        "description": "Set a default value on a node group input.",
+        "params": {"group_name": "string", "input_name": "string", "value": "any"}
+    },
+    {
+        "name": "scan_nodecity_inputs",
+        "description": "List inputs on the 'NodeCity' node group.",
+        "params": {}
+    },
+    {
+        "name": "create_nodecity",
+        "description": "Configure the NodeCity node group with given params.",
+        "params": {"params": "object"}
+    }
+]
 
 # Global persistent connection
 _blender_connection: BlenderConnection = None
@@ -201,49 +259,27 @@ def has_node_group(ctx: Context, group_name: str) -> str:
 
 @mcp.tool()
 def get_node_group_inputs(ctx: Context, group_name: str) -> str:
-    """List interface inputs of a node group."""
     blender = get_blender_connection()
     result = blender.send_command('get_node_group_inputs', {'group_name': group_name})
-    inputs = result.get('result', [])
-    if not inputs:
-        return f"No inputs found for '{group_name}'."
-    lines = [f"- {i['name']} ({i['type']}), default={i['default']}" for i in inputs]
+    # result should now be a list of dicts with 'name','type','default'
+    if not result:
+        return f"No inputs for '{group_name}'"
+    lines = [f"- {i['name']} ({i['type']}), default={i['default']}" for i in result]
     return f"Inputs for '{group_name}':\n" + "\n".join(lines)
 
 @mcp.tool()
-def set_node_group_input(
-    ctx: Context,
-    group_name: str,
-    input_name: str,
-    value: Any
-) -> str:
-    """Set a node group input interface value."""
+def set_node_group_input(ctx: Context, group_name: str, input_name: str, value: Any) -> str:
     blender = get_blender_connection()
-    params = {'group_name': group_name, 'input_name': input_name, 'value': value}
-    result = blender.send_command('set_node_group_input', params)
-    if 'modified_modifiers' in result:
-        return f"Set '{input_name}'={value} on {result['modified_modifiers']} modifier(s)."
-    return f"Error: {result.get('message', 'unknown')}"
-
-@mcp.tool()
-def set_texture(
-    ctx: Context,
-    object_name: str,
-    texture_id: str
-) -> str:
-    """Apply a Polyhaven texture to an object."""
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command('set_texture', {'object_name': object_name, 'texture_id': texture_id})
-        if 'error' in result:
-            return f"Error: {result['error']}"
-        material_info = result.get('material_info', {})
-        info = [f"Material='{result.get('material')}'; maps={result.get('maps')}" ]
-        info.append(f"Nodes={material_info.get('node_count')}, has_nodes={material_info.get('has_nodes')}" )
-        return "Successfully applied texture. " + "; ".join(info)
-    except Exception as e:
-        logger.error(f"Error applying texture: {e}")
-        return f"Error applying texture: {e}"
+    resp = blender.send_command('set_node_group_input', {
+        'group_name': group_name,
+        'input_name': input_name,
+        'value': value
+    })
+    # resp is now the dict returned by the add-on handler
+    if resp.get("status") == "success":
+        return f"✅ {resp['input']} default set to {resp['new_value']}"
+    else:
+        return f"❌ {resp.get('message','unknown error')}"
 
 # === NodeCity Automation Tools ===
 
@@ -259,27 +295,42 @@ def scan_nodecity_inputs(ctx: Context) -> str:
 
 @mcp.tool()
 def create_nodecity(ctx: Context, params: Dict[str, Any]) -> str:
-    """Create an empty object, add NodeCity modifier, and apply params."""
+    results = []
+    for key, val in params.items():
+        resp = set_node_group_input(ctx, "NodeCity", key, val)
+        results.append(resp)
+    return "\n".join([str(r) for r in results])
+
+@mcp.tool()
+def list_parts(ctx: Context) -> str:
+    """Return JSON-string of available Head/Waist/Leg/Arm variants."""
     blender = get_blender_connection()
-    params_json = json.dumps(params)
-    code = f'''import bpy, json
-# Create new empty
-obj = bpy.data.objects.new("NodeCityInstance", None)
-bpy.context.collection.objects.link(obj)
-# Add geometry nodes modifier
-mod = obj.modifiers.new(name="NodeCity", type="NODES")
-mod.node_group = bpy.data.node_groups.get("NodeCity")
-# Apply params
-dict_params = json.loads(r"""{params_json}"""')
-for name, value in dict_params.items():
-    try: setattr(mod, name, value)
-    except: pass
-# Select and activate
-bpy.context.view_layer.objects.active = obj
-obj.select_set(True)
-print("Created NodeCityInstance", dict_params)'''  # noqa
-    blender.send_command('execute_code', {'code': code})
-    return f"✅ Created NodeCityInstance with params: {params}"
+    result = blender.send_command("list_parts")
+    return json.dumps(result, indent=2)
+
+@mcp.tool()
+def init_model(ctx) -> str:
+    """Create a fresh character by loading the base+markers."""
+    blender = get_blender_connection()
+    result  = blender.send_command("init_model")
+    if result.get("status")=="success":
+        return result["message"]
+    else:
+        return f"Error: {result.get('message','init_model failed')}"
+
+@mcp.tool()
+def replace_part(ctx: Context, part_type: str, new_name: str) -> str:
+    """Replace the given part_type with new_name in the Base model."""
+    blender = get_blender_connection()
+    resp = blender.send_command("replace_part", {
+        "part_type": part_type,
+        "new_name": new_name
+    })
+    # resp is a dict with status/message
+    if resp.get("status")=="success":
+        return resp["message"]
+    else:
+        return f"Error: {resp.get('message','unknown')}"
 
 @mcp.prompt()
 def nodecity_autocreate(ctx: Context, user_input: str) -> str:
@@ -301,7 +352,7 @@ The NodeCity input sockets are:
 {scan}
 Choose values for a modern high-density city and respond with only a JSON dict mapping input names to values.
 """
-    llm_resp = ctx.llm({"role":"user","content":llm_prompt})
+    llm_resp = ctx.llm({"role":"city designer","content":llm_prompt})
     try:
         params = json.loads(llm_resp.content)
     except Exception:
@@ -312,6 +363,64 @@ Choose values for a modern high-density city and respond with only a JSON dict m
         return create_nodecity(ctx, params)
     except Exception as e:
         return f"❌ Creation error: {e}"
+
+@mcp.prompt()
+def dynamic_tool_router(ctx: Context, user_input: str) -> str:
+    """
+    Bridge natural language to MCP tool calls.  Sends the full TOOL_MANIFEST
+    to Claude with instructions, so Claude itself decides which tool to invoke.
+
+    - If user is asking for a new 3D character (mentions female/role/character/human),
+      Claude should reply exactly with:
+        { "type": "init_model", "params": {} }
+    - For part replacements, texture, or NodeCity, Claude picks the matching tool JSON.
+    - If user is just chatting or asking non‐Blender things, Claude replies NO_TOOL.
+    """
+    # 1) Build the manifest string
+    manifest_str = json.dumps(TOOL_MANIFEST, indent=2)
+
+    # 2) Craft the system prompt
+    system_msg = f"""
+You are a bridge between natural language and Blender operations.  You have these tools:
+
+{manifest_str}
+
+**Rules**:
+1. Whenever the user requests creating, loading, or preparing a new 3D character—
+   e.g. mentions 'female', 'role', 'character', or 'human' in a modelling context—
+   respond with exactly:
+     {{ "type": "init_model", "params": {{}} }}
+   and nothing else.
+
+2. If the user wants to swap a body part, apply a texture, list assets, or do city design,
+   respond with the corresponding JSON from the manifest.
+
+3. If the user is just talking or asking general questions (non‐Blender), respond with NO_TOOL.
+
+Respond with only the JSON or the literal string NO_TOOL.  Do not include any other text.
+"""
+
+    # 3) Query Claude
+    llm_resp = ctx.llm([
+        {"role": "system", "content": system_msg},
+        {"role": "user",   "content": user_input}
+    ])
+    reply = llm_resp.content.strip()
+
+    # 4) Handle NO_TOOL
+    if reply.upper() == "NO_TOOL":
+        return None
+
+    # 5) Validate that it’s one of our tools
+    try:
+        cmd = json.loads(reply)
+        if isinstance(cmd, dict) and any(tool["name"] == cmd.get("type") for tool in TOOL_MANIFEST):
+            return reply
+    except json.JSONDecodeError:
+        pass
+
+    # 6) Fallback: no action
+    return None
 
 # Start server
 def main():
