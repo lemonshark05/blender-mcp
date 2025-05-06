@@ -179,7 +179,6 @@ def get_blender_connection() -> BlenderConnection:
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     try:
         logger.info("BlenderMCP server starting up")
-        startup_check_nodecity()
         yield {}
     finally:
         global _blender_connection
@@ -333,6 +332,74 @@ def replace_part(ctx: Context, part_type: str, new_name: str) -> str:
         return f"Error: {resp.get('message','unknown')}"
 
 @mcp.prompt()
+def init_model_prompt(ctx: Context, user_input: str) -> str:
+    if re.search(r"(?i)\b(female|role|character|human)\b", user_input):
+        return json.dumps({"type": "init_model", "params": {}})
+    return None
+
+@mcp.prompt()
+def list_parts_prompt(ctx: Context, user_input: str) -> str:
+    if ( re.search(r"(?i)\b(what|which|list|get)\b.*\b(arm|leg|head|waist)s?\b", user_input)
+         and not re.search(r"[A-Za-z]+_[A-Za-z]+", user_input) ):
+        return json.dumps({"type": "list_parts", "params": {}})
+    return None
+
+@mcp.prompt()
+def replace_part_prompt(ctx: Context, user_input: str) -> str:
+    m = re.search(r"\b(Head|Arm|Leg|Waist)_([A-Za-z0-9]+)\b", user_input)
+    if m:
+        return json.dumps({
+            "type": "replace_part",
+            "params": {
+                "part_type": m.group(1),
+                "new_name": f"{m.group(1)}_{m.group(2)}"
+            }
+        })
+    return None
+
+@mcp.prompt()
+def dynamic_tool_router(ctx: Context, user_input: str) -> str:
+    role_tools = [
+        t for t in TOOL_MANIFEST
+        if t["name"] in (
+            "init_model",
+            "list_parts",
+            "replace_part",
+            "get_scene_info",
+            "get_object_info",
+            "execute_blender_code"
+        )
+    ]
+    system_msg = f"""
+You are a bridge between natural language and Blender operations.  You have these ROLE-FOCUSED tools:
+
+{json.dumps(role_tools, indent=2)}
+
+Rules:
+- init_model → create a new character.
+- list_parts → list available body-part variants.
+- replace_part → swap in a named variant.
+- get_scene_info / get_object_info / execute_blender_code → general Blender queries.
+- If none apply, reply NO_TOOL.
+
+Respond *only* with the JSON or the literal string NO_TOOL.  No extra text.
+"""
+    llm_resp = ctx.llm([
+        {"role": "system",  "content": system_msg},
+        {"role": "user",    "content": user_input}
+    ])
+    reply = llm_resp.content.strip()
+    if reply.upper() == "NO_TOOL":
+        return None
+    try:
+        cmd = json.loads(reply)
+        if any(t["name"] == cmd.get("type") for t in role_tools):
+            return reply
+    except:
+        pass
+    return None
+
+@mcp.prompt()
 def nodecity_autocreate(ctx: Context, user_input: str) -> str:
     """Auto workflow: scan inputs, ask LLM for values, create instance."""
     # Ensure Blender is connected
@@ -363,64 +430,6 @@ Choose values for a modern high-density city and respond with only a JSON dict m
         return create_nodecity(ctx, params)
     except Exception as e:
         return f"❌ Creation error: {e}"
-
-@mcp.prompt()
-def dynamic_tool_router(ctx: Context, user_input: str) -> str:
-    """
-    Bridge natural language to MCP tool calls.  Sends the full TOOL_MANIFEST
-    to Claude with instructions, so Claude itself decides which tool to invoke.
-
-    - If user is asking for a new 3D character (mentions female/role/character/human),
-      Claude should reply exactly with:
-        { "type": "init_model", "params": {} }
-    - For part replacements, texture, or NodeCity, Claude picks the matching tool JSON.
-    - If user is just chatting or asking non‐Blender things, Claude replies NO_TOOL.
-    """
-    # 1) Build the manifest string
-    manifest_str = json.dumps(TOOL_MANIFEST, indent=2)
-
-    # 2) Craft the system prompt
-    system_msg = f"""
-You are a bridge between natural language and Blender operations.  You have these tools:
-
-{manifest_str}
-
-**Rules**:
-1. Whenever the user requests creating, loading, or preparing a new 3D character—
-   e.g. mentions 'female', 'role', 'character', or 'human' in a modelling context—
-   respond with exactly:
-     {{ "type": "init_model", "params": {{}} }}
-   and nothing else.
-
-2. If the user wants to swap a body part, apply a texture, list assets, or do city design,
-   respond with the corresponding JSON from the manifest.
-
-3. If the user is just talking or asking general questions (non‐Blender), respond with NO_TOOL.
-
-Respond with only the JSON or the literal string NO_TOOL.  Do not include any other text.
-"""
-
-    # 3) Query Claude
-    llm_resp = ctx.llm([
-        {"role": "system", "content": system_msg},
-        {"role": "user",   "content": user_input}
-    ])
-    reply = llm_resp.content.strip()
-
-    # 4) Handle NO_TOOL
-    if reply.upper() == "NO_TOOL":
-        return None
-
-    # 5) Validate that it’s one of our tools
-    try:
-        cmd = json.loads(reply)
-        if isinstance(cmd, dict) and any(tool["name"] == cmd.get("type") for tool in TOOL_MANIFEST):
-            return reply
-    except json.JSONDecodeError:
-        pass
-
-    # 6) Fallback: no action
-    return None
 
 # Start server
 def main():
