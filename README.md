@@ -6,7 +6,9 @@
 - **Low-Poly City Planning (NodeCity)**  
   - Geometry Nodes “CityGenerator” for street and block layout  
   - MCP tools to adjust node group parameters: `has_node_group`, `get_node_group_inputs`, `set_node_group_input`  
-  - `execute_blender_code`: scatter assets (trees, benches, vehicles)  
+  - `execute_blender_code`: scatter assets (trees, benches, vehicles)
+ <img width="1260" alt="Screenshot 2025-05-13 at 3 08 18 PM" src="https://github.com/user-attachments/assets/e09a9f85-d792-449b-93eb-192290e91298" />
+
 - **Hybrid Workflow**  
   - Geometry Nodes for instant visual feedback and broad procedural layouts  
   - Python API for batch operations, custom logic, and fine control  
@@ -53,8 +55,10 @@
    - `init_model` to spawn base character  
    - `execute_blender_code` to load head, waist, arms, legs assets  
 2. **Part Replacement**  
-   - `list_parts()` → identify “head”, “waist”, “arms”, “legs”  
-   - `replace_part("head", asset_id)` (and similarly for other parts)  
+   - `list_parts()` → identify “head”, “waist”, “arms”, “legs”
+<img width="748" alt="Screenshot 2025-05-13 at 3 09 15 PM" src="https://github.com/user-attachments/assets/8c40eadc-8076-4ff5-a0ab-4789f3795f04" />
+   - `replace_part("head", asset_id)` (and similarly for other parts)
+<img width="748" alt="Screenshot 2025-05-13 at 3 10 14 PM" src="https://github.com/user-attachments/assets/4e267115-edaf-4754-84a0-0f7c8779bc93" />
 3. **Final Touches**  
    - Material tweaks and posing via Python API or Geometry Nodes
 
@@ -63,7 +67,6 @@
    - Geometry Nodes “CityGenerator” for streets & blocks  
 2. **MCP Parameter Tweaks**  
    - `has_node_group("NodeCity")`  etc.  
-3. **A**
 
 ## Install the Claude MCP Server
 
