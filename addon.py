@@ -10,7 +10,7 @@ from bpy.props import StringProperty, IntProperty, BoolProperty, EnumProperty
 import io
 from contextlib import redirect_stdout
 import re
-from typing import Any
+from typing import Any, Dict, List
 
 bl_info = {
     "name": "Blender MCP",
@@ -20,6 +20,20 @@ bl_info = {
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
+}
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+ASSET_LIBRARY = (
+    "/Users/hula/Documents/Female/"
+    "CustomizeFemaleBaseMesh_AnimeStyle_v1_3_AssetBrowser.blend"
+)
+BASE_PREFIX = "AnimeStyle_Female_Base"
+
+DELETE_PREFS: Dict[str, List[str]] = {
+    "Head":  ["Head", "Ear"],
+    "Arm":   ["Arm",  "Hand"],
+    "Leg":   ["Leg",  "Foot"],
+    "Waist": ["Waist"],
 }
 
 class BlenderMCPServer:
@@ -212,17 +226,48 @@ class BlenderMCPServer:
             return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
         
     def list_parts(self):
-        """Return a dict of all available part-objects grouped by type."""
+        """
+        Return a dictionary of available character-parts grouped by type.
+
+        Example output:
+        {
+            "Head":  ["HeadA", "HeadB", ...],
+            "Waist": ["Waist_SpiderA", ...],
+            "Leg":   ["Leg_Horse", ...],
+            "Arm":   ["Arm_Human", ...]
+        }
+
+        Errors are reported as:
+            {"status": "error", "message": "..."}
+        """
+        # UI switch: the add-on lets users disable role models
         if not bpy.context.scene.blendermcp_use_roles:
-            return {"status":"error", "message":"Role Models disabled in UI"}
-        
-        out = {"Head": [], "Waist": [], "Leg": [], "Arm": []}
-        pat = re.compile(r"^(Head|Waist|Leg|Arm)(?:[\._].*)?$")
-        for obj in bpy.data.objects:
-            m = pat.match(obj.name)
-            if m:
-                out[m.group(1)].append(obj.name)
-        return out
+            return {"status": "error", "message": "Role Models disabled in UI"}
+
+        # Path to the external asset-library .blend
+        lib_path = (
+            "/Users/hula/Documents/Female/"
+            "CustomizeFemaleBaseMesh_AnimeStyle_v1_3_AssetBrowser.blend"
+        )
+        if not os.path.exists(lib_path):
+            return {"status": "error", "message": f"Asset library not found: {lib_path}"}
+
+        # Containers for the four main categories
+        parts = {"Head": [], "Waist": [], "Leg": [], "Arm": []}
+        name_pattern = re.compile(r"^(Head|Waist|Leg|Arm)(?:[._].*)?$")
+
+        # Read only the names (no links) for minimal overhead
+        with bpy.data.libraries.load(lib_path, link=False) as (src, _dst):
+            for obj_name in src.objects:
+                match = name_pattern.match(obj_name)
+                if match:
+                    parts[match.group(1)].append(obj_name)
+
+        # Sort each list alphabetically for cleaner UI display
+        for key in parts:
+            parts[key].sort()
+
+        return parts
     
     def init_model(self):
         """Load the base mesh plus all Marker_ objects into the scene."""
@@ -249,61 +294,88 @@ class BlenderMCPServer:
 
         return {"status":"success", "message":"Base character initialized"}
 
-    def replace_part(self, part_type: str, new_name: str):
+    def replace_part(self, part_type: str, new_name: str) -> Dict[str, str]:
         """
-        Delete the old faces/material slots for a given part_type,
-        append+align+join the new asset named new_name under Marker_<part_type>.
-        """
-        if not bpy.context.scene.blendermcp_use_roles:
-            return {"status":"error", "message":"Role Models disabled in UI"}
-        
-        # 1) find base mesh
-        base = max(
-            (o for o in bpy.data.objects if o.type=='MESH' and o.name.startswith("AnimeStyle_Female_Base")),
-            key=lambda o: len(o.data.vertices),
-            default=None
-        )
-        if not base:
-            raise RuntimeError("Base mesh not found")
+        Replace one of the four role-model parts (Head, Arm, Leg, Waist).
 
-        # 2) delete old faces + slots
-        import bmesh
-        bm = bmesh.new(); bm.from_mesh(base.data)
-        # collect slot indices whose root == part_type
-        to_remove = [
-            i for i,slot in enumerate(base.material_slots)
-            if slot.material and slot.material.name.split('.',1)[0] == part_type
+        * Removes faces and material slots whose root names match DELETE_PREFS[part_type].
+        * Appends the asset called `new_name` from the external library.
+        * Aligns it to `Marker_<part_type>` and joins it into the base mesh.
+
+        Returns {"status": "success", "message": "..."} on success,
+        or {"status": "error",  "message": "..."} when something blocks the operation.
+        """
+        # 0.  Feature switch in the add-on UI
+        if not bpy.context.scene.blendermcp_use_roles:
+            return {"status": "error", "message": "Role Models disabled in UI"}
+
+        # 1.  Sanity checks ---------------------------------------------------------
+        part_type = part_type.capitalize()
+        if part_type not in DELETE_PREFS:
+            return {"status": "error", "message": f"Unsupported part type: {part_type}"}
+
+        if not os.path.exists(ASSET_LIBRARY):
+            return {"status": "error", "message": f"Asset library not found:\n{ASSET_LIBRARY}"}
+
+        # 2.  Locate the base mesh --------------------------------------------------
+        bases = [
+            obj for obj in bpy.data.objects
+            if obj.type == 'MESH' and obj.name.startswith(BASE_PREFIX)
         ]
-        for face in [f for f in bm.faces if f.material_index in to_remove]:
-            bm.faces.remove(face)
-        # remove orphan verts
-        for v in [v for v in bm.verts if not v.link_faces]:
-            bm.verts.remove(v)
-        bm.to_mesh(base.data); base.data.update()
-        for idx in sorted(to_remove, reverse=True):
-            base.data.materials.pop(index=idx)
+        if not bases:
+            return {"status": "error", "message": f"No mesh named {BASE_PREFIX}* found"}
+        base = max(bases, key=lambda o: len(o.data.vertices))
+
+        # 3.  Erase old faces & material slots --------------------------------------
+        bm = bmesh.new()
+        bm.from_mesh(base.data)
+
+        slots_to_strip = [
+            i for i, slot in enumerate(base.material_slots)
+            if slot.material and slot.material.name.split('.', 1)[0] in DELETE_PREFS[part_type]
+        ]
+
+        if slots_to_strip:
+            # Remove faces assigned to those slots
+            for face in [f for f in bm.faces if f.material_index in slots_to_strip]:
+                bm.faces.remove(face)
+            # Remove orphaned vertices
+            for v in [v for v in bm.verts if not v.link_faces]:
+                bm.verts.remove(v)
+
+            bm.to_mesh(base.data)
+            base.data.update()
+
+            # Remove the material slots themselves (back-to-front)
+            for idx in sorted(slots_to_strip, reverse=True):
+                base.data.materials.pop(index=idx)
+
         bm.free()
 
-        # 3) append new object
-        blend_path = os.path.join("/Users/hula/Documents/Female",
-                                  "CustomizeFemaleBaseMesh_AnimeStyle_v1_3_AssetBrowser.blend")
-        with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+        # 4.  Append the new part from the library ----------------------------------
+        with bpy.data.libraries.load(ASSET_LIBRARY, link=False) as (src, dst):
             if new_name not in src.objects:
-                raise RuntimeError(f"{new_name} not found")
+                return {"status": "error",
+                        "message": f"Asset {new_name!r} not found in library"}
             dst.objects = [new_name]
-        new_obj = bpy.data.objects[new_name]
-        # link if needed
-        coll = bpy.context.scene.collection
-        if new_obj.name not in coll.objects:
-            coll.objects.link(new_obj)
 
-        # 4) align
+        new_obj = bpy.data.objects[new_name]
+
+        # 5.  Align the new part directly to its Marker -----------------------------
         marker = bpy.data.objects.get(f"Marker_{part_type}")
         if not marker:
-            raise RuntimeError(f"Marker_{part_type} not found")
+            return {"status": "error",
+                    "message": f"Marker object Marker_{part_type!r} not found"}
+
+        # ensure the new object is linked into the scene collection
+        scene_coll = bpy.context.scene.collection
+        if new_obj.name not in scene_coll.objects:
+            scene_coll.objects.link(new_obj)
+
+        # simple world-matrix copy for perfect snapping
         new_obj.matrix_world = marker.matrix_world.copy()
 
-        # 5) join
+        # 6.  Join into the base mesh ----------------------------------------------
         for o in bpy.context.view_layer.objects:
             o.select_set(False)
         base.select_set(True)
@@ -311,7 +383,9 @@ class BlenderMCPServer:
         bpy.context.view_layer.objects.active = base
         bpy.ops.object.join()
 
-        return {"status":"success", "message": f"{part_type} replaced with {new_name}"}
+        return {"status": "success",
+                "message": f"{part_type} replaced with {new_name}"}
+
     
     def has_node_group(self, group_name):
         return group_name in bpy.data.node_groups
